@@ -63,7 +63,7 @@ export interface CollageClip {
   seed?: number;
 }
 
-export interface CollageBurstProps {
+export type CollageBurstProps = {
   backgroundSrc: string;
   backgroundInSeconds?: number;
   curtainStartSeconds: number;
