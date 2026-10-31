@@ -10,13 +10,14 @@ Implements the budget governance rules from the spec:
 from __future__ import annotations
 
 import json
+import math
 import uuid
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
 
-from lib.config_model import BudgetMode
+from lib.config_model import BudgetConfig, BudgetMode
 
 
 class EntryStatus(str, Enum):
@@ -49,9 +50,14 @@ class CostTracker:
         mode: BudgetMode = BudgetMode.WARN,
         cost_log_path: Optional[Path] = None,
     ) -> None:
-        self.budget_total_usd = budget_total_usd
-        self.reserve_pct = reserve_pct
-        self.single_action_approval_usd = single_action_approval_usd
+        budget = BudgetConfig(
+            total_usd=budget_total_usd,
+            reserve_pct=reserve_pct,
+            single_action_approval_usd=single_action_approval_usd,
+        )
+        self.budget_total_usd = budget.total_usd
+        self.reserve_pct = budget.reserve_pct
+        self.single_action_approval_usd = budget.single_action_approval_usd
         self.require_approval_for_new_paid_tool = require_approval_for_new_paid_tool
         self.mode = mode
         self.cost_log_path = cost_log_path
@@ -100,6 +106,7 @@ class CostTracker:
 
     def estimate(self, tool: str, operation: str, estimated_usd: float) -> str:
         """Record an estimate. Returns entry ID."""
+        estimated_usd = self._validate_cost(estimated_usd, "estimated_usd")
         entry_id = self._new_id()
         self.entries.append({
             "id": entry_id,
@@ -121,6 +128,7 @@ class CostTracker:
         when the action exceeds the single-action approval threshold.
         """
         entry = self._find(entry_id)
+        self._validate_entry_costs(entry)
         estimated = entry["estimated_usd"]
 
         # Check single-action approval threshold
@@ -163,7 +171,9 @@ class CostTracker:
 
     def reconcile(self, entry_id: str, actual_usd: float, success: bool = True) -> None:
         """Reconcile actual spend after tool execution."""
+        actual_usd = self._validate_cost(actual_usd, "actual_usd")
         entry = self._find(entry_id)
+        self._validate_entry_costs(entry)
         entry["status"] = EntryStatus.COMPLETED.value if success else EntryStatus.FAILED.value
         entry["actual_usd"] = round(actual_usd, 4)
         entry["reserved_usd"] = 0.0
@@ -502,11 +512,45 @@ class CostTracker:
     def _load(self) -> None:
         with open(self.cost_log_path) as f:  # type: ignore[arg-type]
             data = json.load(f)
-        self.entries = data.get("entries", [])
-        self.budget_total_usd = data.get("budget_total_usd", self.budget_total_usd)
-        self._approved_tools = set(data.get("approved_tools", []))
+        if not isinstance(data, dict):
+            raise ValueError("Cost log must contain an object")
+        entries = data.get("entries", [])
+        if not isinstance(entries, list):
+            raise ValueError("Cost log entries must be a list")
+        for entry in entries:
+            self._validate_entry_costs(entry)
+        budget_total_usd = self._validate_cost(
+            data.get("budget_total_usd", self.budget_total_usd), "budget_total_usd"
+        )
+        for name in ("budget_reserved_usd", "budget_spent_usd"):
+            if name in data:
+                self._validate_cost(data[name], name)
+        approved_tools = set(data.get("approved_tools", []))
+        self.entries = entries
+        self.budget_total_usd = budget_total_usd
+        self._approved_tools = approved_tools
 
     # ---- Helpers ----
+
+    @staticmethod
+    def _validate_cost(value: Any, name: str) -> float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{name} must be a finite, non-negative number")
+        try:
+            number = float(value)
+        except OverflowError as exc:
+            raise ValueError(f"{name} must be a finite, non-negative number") from exc
+        if not math.isfinite(number) or number < 0:
+            raise ValueError(f"{name} must be a finite, non-negative number")
+        return number
+
+    @classmethod
+    def _validate_entry_costs(cls, entry: Any) -> None:
+        if not isinstance(entry, dict) or "estimated_usd" not in entry:
+            raise ValueError("Cost log entry must contain estimated_usd")
+        for name in ("estimated_usd", "reserved_usd", "actual_usd"):
+            if name in entry:
+                cls._validate_cost(entry[name], name)
 
     def _find(self, entry_id: str) -> dict[str, Any]:
         for entry in self.entries:
